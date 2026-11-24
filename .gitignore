@@ -17,3 +17,4 @@ bridge/jbwapi/target/
 .idea/
 .vscode/
 .pytest_cache/
+bridge/jbwapi/dependency-reduced-pom.xml
