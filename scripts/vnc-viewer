@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Shim: scbw requires a binary named `vnc-viewer` on PATH.
+# If VNC_UPSCALE_SIZE (WxH) is set, run the viewer inside gamescope, which renders
+# it at the native 640x480 and upscales the window (FSR / NIS / ...).
+set -euo pipefail
+
+viewer=""
+for candidate in xtigervncviewer vncviewer; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        viewer="$candidate"
+        break
+    fi
+done
+if [ -z "$viewer" ]; then
+    echo "No VNC viewer found. Install one: sudo apt install tigervnc-viewer" >&2
+    exit 1
+fi
+
+if [ -z "${VNC_UPSCALE_SIZE:-}" ]; then
+    exec "$viewer" "$@"
+fi
+
+out_w="${VNC_UPSCALE_SIZE%x*}"
+out_h="${VNC_UPSCALE_SIZE#*x}"
+gs_args=(-w 640 -h 480 -W "$out_w" -H "$out_h" -S fit
+    -F "${VNC_UPSCALE_FILTER:-fsr}" --sharpness "${VNC_UPSCALE_SHARPNESS:-2}")
+case "${VNC_UPSCALE_WINDOW:-windowed}" in
+    fullscreen) gs_args+=(-f) ;;
+    borderless) gs_args+=(-b) ;;
+esac
+# sdl / wayland; empty = gamescope default. NVIDIA+GNOME fullscreen may flicker.
+if [ -n "${VNC_UPSCALE_BACKEND:-}" ]; then
+    gs_args+=(--backend "$VNC_UPSCALE_BACKEND")
+fi
+# Fullscreen viewer inside gamescope's 640x480 nested display: no borders, 1:1 pixels.
+exec gamescope "${gs_args[@]}" -- "$viewer" -FullScreen "$@"

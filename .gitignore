@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# JBWAPI Maven build artifacts
+bridge/jbwapi/target/
+
+# General
+.env
+.idea/
+.vscode/
+.pytest_cache/
