@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from PIL import Image
 from pydantic import BaseModel, Field, ValidationError
 
+from starcraft_diffusion_gemma.brain.traces import ToolCallTrace
 from starcraft_diffusion_gemma.llm.client import (
     DiffusionGemmaClient,
     ToolCall,
@@ -38,17 +39,35 @@ from starcraft_diffusion_gemma.state.models import (
 
 S2_TOOLS_SYSTEM_PROMPT = (
     "You are System 2 (strategic macro planner) for a StarCraft: Brood War "
-    "Protoss Zealot + Dragoon bot. Inspect the minimap, economy, build order, "
-    "and recent System 1 tactical reports. Call tools ONLY when you want to "
-    "change macro settings (queue structures, adjust Zealot/Dragoon ratio or "
-    "gateway/probe targets, toggle Singularity Charge, or set an expansion). "
-    "After applying any needed tool calls, briefly summarize the strategic adjustment."
+    "Protoss Zealot + Dragoon bot. Inspect the minimap, economy, bases, build order, "
+    "stray-unit status, and recent System 1 tactical reports. "
+    "Strategic guidelines: "
+    "(1) Expansion: YOU decide when to expand. When ready to take a natural or third "
+    "Nexus (typically ~20-28 supply after Cybernetics Core or when floating minerals), "
+    "call set_expand_target(enable=True, x, y) using the exact natural/free_exp tile "
+    "coordinates from Bases, and raise target_probes (e.g. 36-44 on 2 bases) and "
+    "target_gateways (4-6 on 2 bases). S0 will reserve 400 minerals and build the Nexus. "
+    "(2) Do NOT call queue_structure for buildings already in the opening build order "
+    "or already listed in Queued structures. "
+    "(3) Attacking: Be proactive, not passive. If attacking BEFORE expanding (1 Nexus), "
+    "push early with 4-6+ combat units. If you expanded FIRST (2+ Nexuses), defend until "
+    "you have a stronger timing force (8-12+ combat units, ideally with Singularity Charge), "
+    "then push the enemy base. "
+    "(4) Stray/chasing units: Notice any STRAY units (e.g. chasing a lone enemy SCV across "
+    "the map) and decide in your directive whether to leash/recall them (leash_army=True) "
+    "or allow pursuit (leash_army=False). "
+    "Call tools ONLY when changing macro settings, then briefly summarize."
 )
 
 S2_DIRECTIVE_SYSTEM_PROMPT = (
     "You are System 2 finalizing the strategic directive for System 1 and the "
     "S0 Protoss Zealot + Dragoon executor. Emit a single valid S2Directive JSON "
-    "object reflecting the current game state and any macro tool actions just taken."
+    "object reflecting the current game state and any macro tool actions just taken. "
+    "Set phase='mid_push', posture_hint='push', and attack_target=<enemy_base coords> "
+    "when ready to attack (1-base early push at 4-6+ combat units before expanding, or "
+    "2-base timing push at 8-12+ combat units after expanding). "
+    "Set leash_army=True to recall stray/chasing units back to the army when not pushing, "
+    "or leash_army=False only if you intentionally want units to chase or scout."
 )
 
 
@@ -208,6 +227,19 @@ class S2ActionState:
         return json.dumps({"ok": False, "error": "unhandled tool"})
 
 
+@dataclass
+class S2RunCapture:
+    """Mutable capture bag populated progressively during ``S2Agent.plan``."""
+
+    step1_system_prompt: str = ""
+    step1_user_prompt: str = ""
+    step1_reasoning: str | None = None
+    step1_summary: str = ""
+    tool_traces: list[ToolCallTrace] = field(default_factory=list)
+    step2_system_prompt: str = ""
+    step2_user_prompt: str = ""
+
+
 @dataclass(frozen=True)
 class S2Result:
     """Output of one complete two-step S2 planning cycle."""
@@ -216,6 +248,8 @@ class S2Result:
     tool_calls: list[ToolCall]
     tool_summary: str
     latency_secs: float
+    tool_traces: list[ToolCallTrace] = field(default_factory=list)
+    step1_reasoning: str | None = None
 
 
 class S2Agent:
@@ -244,6 +278,8 @@ class S2Agent:
         recent_s1: list[S1Output],
         current_directive: S2Directive,
         reason: str = "periodic",
+        capture: S2RunCapture | None = None,
+        army_target: TilePoint | None = None,
     ) -> S2Result:
         """
         Execute a two-step S2 strategic turn.
@@ -259,11 +295,13 @@ class S2Agent:
             recent_s1 (list[S1Output]): Recent S1 outputs for tactical context.
             current_directive (S2Directive): Previously active S2 directive.
             reason (str): Trigger reason (e.g. "periodic", "s1_escalation:...").
+            capture (S2RunCapture | None): Optional bag to record prompts/tools even on error.
 
         Returns:
             S2Result: New directive, executed tool calls, summary, and latency.
         """
         start = time.perf_counter()
+        cap = capture if capture is not None else S2RunCapture()
         img = image_part(minimap)
         s1_lines = (
             [
@@ -275,13 +313,24 @@ class S2Agent:
             if recent_s1
             else ["- none yet"]
         )
+        queued_str = (
+            ", ".join(s.value for s in action_state.queued_structures)
+            if action_state.queued_structures
+            else "none"
+        )
+        expand_str = (
+            f"({action_state.expand_target.x},{action_state.expand_target.y})"
+            if action_state.expand_target is not None
+            else "none"
+        )
         context_text = "\n".join(
             [
                 legend,
                 "",
                 f"Trigger: {reason}",
-                state.compact_summary(),
+                state.compact_summary(army_target=army_target),
                 action_state.build_order.status_text(state),
+                f"Queued structures: {queued_str} | Pending expand_target: {expand_str}",
                 f"Current directive: {current_directive.model_dump_json()}",
                 "Recent S1 outputs:",
                 *s1_lines,
@@ -289,19 +338,29 @@ class S2Agent:
         )
 
         # Step 1: Tool calling for macro mutations.
+        step1_user = (
+            context_text
+            + "\n\nUse tools if macro adjustments are needed, then summarize."
+        )
+        cap.step1_system_prompt = S2_TOOLS_SYSTEM_PROMPT
+        cap.step1_user_prompt = step1_user
         tool_msgs = [
             system(S2_TOOLS_SYSTEM_PROMPT),
-            user(
-                img,
-                context_text
-                + "\n\nUse tools if macro adjustments are needed, then summarize.",
-            ),
+            user(img, step1_user),
         ]
         tool_results_log: list[str] = []
 
         def execute(call: ToolCall) -> str:
             res = action_state.apply_tool(call, state)
             tool_results_log.append(f"{call.name}({call.arguments}) -> {res}")
+            cap.tool_traces.append(
+                ToolCallTrace(
+                    id=call.id,
+                    name=call.name,
+                    arguments=dict(call.arguments),
+                    result=res,
+                )
+            )
             return res
 
         final_turn, calls = self._client.run_tools(
@@ -311,27 +370,29 @@ class S2Agent:
             max_steps=self._max_tool_steps,
             max_tokens=self._tool_max_tokens,
         )
+        cap.step1_reasoning = final_turn.reasoning
+        cap.step1_summary = final_turn.content
 
         # Step 2: Emit validated structured S2Directive.
         tools_recap = (
             "\n".join(tool_results_log) if tool_results_log else "No tool calls made."
         )
+        step2_user = "\n".join(
+            [
+                context_text,
+                "",
+                "Macro tool calls executed in Step 1:",
+                tools_recap,
+                f"Step 1 summary: {final_turn.content or '(none)'}",
+                "",
+                "Emit the updated S2Directive JSON.",
+            ]
+        )
+        cap.step2_system_prompt = S2_DIRECTIVE_SYSTEM_PROMPT
+        cap.step2_user_prompt = step2_user
         directive_msgs = [
             system(S2_DIRECTIVE_SYSTEM_PROMPT),
-            user(
-                img,
-                "\n".join(
-                    [
-                        context_text,
-                        "",
-                        "Macro tool calls executed in Step 1:",
-                        tools_recap,
-                        f"Step 1 summary: {final_turn.content or '(none)'}",
-                        "",
-                        "Emit the updated S2Directive JSON.",
-                    ]
-                ),
-            ),
+            user(img, step2_user),
         ]
         directive = self._client.structured(
             directive_msgs,
@@ -344,4 +405,6 @@ class S2Agent:
             tool_calls=calls,
             tool_summary=final_turn.content,
             latency_secs=time.perf_counter() - start,
+            tool_traces=list(cap.tool_traces),
+            step1_reasoning=final_turn.reasoning,
         )

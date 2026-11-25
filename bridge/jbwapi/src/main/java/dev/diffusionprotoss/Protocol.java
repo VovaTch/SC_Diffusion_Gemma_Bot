@@ -50,6 +50,9 @@ public final class Protocol {
         public int gas;
         public int supply_used;
         public int supply_total;
+        public int mineral_workers;
+        public int gas_workers;
+        public int idle_workers;
 
         public TilePointDto our_base;
         public TilePointDto natural_base;
@@ -85,6 +88,7 @@ public final class Protocol {
         public double zealot_ratio = 0.4;
         public double dragoon_ratio = 0.6;
         public boolean want_singularity_charge = true;
+        public boolean leash_army = true;
         public List<String> queued_structures = new ArrayList<>();
         public TilePointDto expand_target = null;
         public BuildStepDto active_build_step = null;

@@ -14,16 +14,18 @@ from __future__ import annotations
 import argparse
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response
 
 from starcraft_diffusion_gemma.brain.coordinator import (
     BotCoordinator,
     CoordinatorConfig,
 )
+from starcraft_diffusion_gemma.brain.traces import TracesSnapshot
 from starcraft_diffusion_gemma.llm.client import DEFAULT_MODEL, HttpTransport
 from starcraft_diffusion_gemma.state.models import CommandBundle, GameState
 
@@ -82,6 +84,20 @@ def create_app(
             raise HTTPException(status_code=404, detail="No minimap rendered yet")
         return Response(content=png, media_type="image/png")
 
+    @app.get("/debug/traces", response_model=TracesSnapshot)
+    def debug_traces(
+        since_id: int = Query(default=0, ge=0),
+        limit: int = Query(default=50, ge=1, le=200),
+    ) -> TracesSnapshot:
+        return coord.traces_snapshot(since_id=since_id, limit=limit)
+
+    @app.get("/debug/images/{image_id}.png")
+    def debug_image(image_id: str) -> Response:
+        png = coord.get_image_png(image_id)
+        if png is None:
+            raise HTTPException(status_code=404, detail=f"Image {image_id!r} not found")
+        return Response(content=png, media_type="image/png")
+
     return app
 
 
@@ -97,6 +113,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--s1-interval", type=float, default=2.5)
     parser.add_argument("--s2-interval", type=float, default=30.0)
     parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=None,
+        help="Optional directory to persist traces.jsonl and sent minimap PNGs",
+    )
+    parser.add_argument(
         "--no-llm",
         action="store_true",
         help="Disable background S1/S2 LLM loops (pure S0 build-order mode)",
@@ -111,6 +133,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         s1_interval_secs=opts.s1_interval,
         s2_interval_secs=opts.s2_interval,
         enable_llm=not opts.no_llm,
+        log_dir=opts.log_dir,
     )
     app = create_app(vllm_url=opts.vllm_url, model=opts.model, config=cfg)
     uvicorn.run(app, host=opts.host, port=opts.port)

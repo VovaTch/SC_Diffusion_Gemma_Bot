@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import Counter
 from enum import StrEnum
+import math
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -120,6 +121,9 @@ class GameState(BaseModel):
     gas: int = Field(default=0, ge=0)
     supply_used: int = Field(default=4, ge=0)
     supply_total: int = Field(default=9, ge=0)
+    mineral_workers: int = Field(default=0, ge=0)
+    gas_workers: int = Field(default=0, ge=0)
+    idle_workers: int = Field(default=0, ge=0)
 
     our_base: TilePoint | None = None
     natural_base: TilePoint | None = None
@@ -162,12 +166,34 @@ class GameState(BaseModel):
         """Count known/visible enemy buildings by normalized type name."""
         return dict(Counter(b.unit_type.lower() for b in self.enemy_buildings))
 
-    def compact_summary(self) -> str:
+    def combat_units(self) -> list[UnitSnapshot]:
+        """Return our non-worker combat units."""
+        return [u for u in self.our_units if u.unit_type.lower() != "probe"]
+
+    def stray_combat_units(
+        self,
+        reference: TilePoint | None = None,
+        max_dist_tiles: float = 20.0,
+    ) -> list[UnitSnapshot]:
+        """Return combat units farther than ``max_dist_tiles`` from ``reference``."""
+        ref = reference or self.choke_point or self.natural_base or self.our_base
+        if ref is None:
+            return []
+        return [
+            u
+            for u in self.combat_units()
+            if math.hypot(u.x - ref.x, u.y - ref.y) > max_dist_tiles
+        ]
+
+    def compact_summary(self, army_target: TilePoint | None = None) -> str:
         """
         Render a dense text summary suitable for S1/S2 prompts.
 
+        Args:
+            army_target (TilePoint | None): Optional active army target for stray detection.
+
         Returns:
-            str: Multi-line summary of time, economy, army, buildings, and enemies.
+            str: Multi-line summary of time, economy, bases, army spread, and enemies.
         """
         mins = int(self.game_seconds // 60)
         secs = int(self.game_seconds % 60)
@@ -187,6 +213,63 @@ class GameState(BaseModel):
             f"Visible enemy units: {enemies or 'none'}",
             f"Visible enemy buildings: {e_bldgs or 'none'}",
         ]
+        if self.mineral_workers or self.gas_workers or self.idle_workers:
+            lines.append(
+                f"Workers: mineral={self.mineral_workers}, "
+                f"gas={self.gas_workers}, idle={self.idle_workers}"
+            )
+        base_parts: list[str] = []
+        if self.our_base is not None:
+            base_parts.append(f"our=({self.our_base.x},{self.our_base.y})")
+        if self.natural_base is not None:
+            base_parts.append(f"natural=({self.natural_base.x},{self.natural_base.y})")
+        if self.choke_point is not None:
+            base_parts.append(f"choke=({self.choke_point.x},{self.choke_point.y})")
+        if self.enemy_base is not None:
+            base_parts.append(f"enemy=({self.enemy_base.x},{self.enemy_base.y})")
+        free_exps = [
+            e
+            for e in self.expansions
+            if not e.is_occupied_by_us and not e.is_occupied_by_enemy
+        ]
+        if free_exps:
+            if self.our_base is not None:
+                ob = self.our_base
+                free_exps.sort(key=lambda e: math.hypot(e.x - ob.x, e.y - ob.y))
+            exp_str = ", ".join(f"({e.x},{e.y})" for e in free_exps[:4])
+            base_parts.append(f"free_exp=[{exp_str}]")
+        if base_parts:
+            lines.append("Bases: " + " | ".join(base_parts))
+
+        combat = self.combat_units()
+        if combat:
+            cx = round(sum(u.x for u in combat) / len(combat))
+            cy = round(sum(u.y for u in combat) / len(combat))
+            ref = army_target or self.choke_point or self.natural_base or self.our_base
+            strays = self.stray_combat_units(reference=ref, max_dist_tiles=20.0)
+            army_line = f"Army ({len(combat)} combat): centroid=({cx},{cy})"
+            if strays:
+                enemy_workers = [
+                    e
+                    for e in self.enemy_units
+                    if e.unit_type.lower() in {"scv", "probe", "drone"}
+                ]
+                chasing_worker = any(
+                    math.hypot(u.x - ew.x, u.y - ew.y) <= 12.0
+                    for u in strays
+                    for ew in enemy_workers
+                )
+                sample = ", ".join(f"{u.unit_type}@({u.x},{u.y})" for u in strays[:3])
+                note = " [CHASING ENEMY WORKER]" if chasing_worker else ""
+                army_line += f" | STRAY: {len(strays)} >20t from target ({sample}){note}"
+            lines.append(army_line)
+
+        if self.enemy_units:
+            e_pos = ", ".join(
+                f"{e.unit_type}@({e.x},{e.y})" for e in self.enemy_units[:5]
+            )
+            lines.append(f"Enemy positions: {e_pos}")
+
         if self.upgrades_completed or self.upgrades_in_progress:
             lines.append(
                 f"Upgrades done: {self.upgrades_completed} | "
@@ -277,6 +360,13 @@ class S2Directive(BaseModel):
         default=True,
         description="Whether to research Dragoon range at Cybernetics Core",
     )
+    leash_army: bool = Field(
+        default=True,
+        description=(
+            "True to recall/leash stray combat units back to army_target when not pushing "
+            "(prevents chasing a lone SCV across the map); False to allow free pursuit/scouting"
+        ),
+    )
     want_expand: bool = Field(
         default=False, description="Whether to take a natural/third Nexus expansion"
     )
@@ -306,6 +396,7 @@ class CommandBundle(BaseModel):
     zealot_ratio: float = 0.4
     dragoon_ratio: float = 0.6
     want_singularity_charge: bool = True
+    leash_army: bool = True
     queued_structures: list[ProtossStructure] = Field(default_factory=list)
     expand_target: TilePoint | None = None
     active_build_step: BuildStep | None = None
